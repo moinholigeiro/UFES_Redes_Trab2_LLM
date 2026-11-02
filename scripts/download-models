@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+mkdir -p models
+curl --fail --location --continue-at - \
+  'https://huggingface.co/unsloth/Qwen3-1.7B-GGUF/resolve/d7f544eead698dbd1f15126ef60b45a1e1933222/Qwen3-1.7B-Q4_K_M.gguf' \
+  --output models/Qwen3-1.7B-Q4_K_M.gguf
+curl --fail --location --continue-at - \
+  'https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/e87f176479d0855a907a41277aca2f8ee7a09523/Qwen3.5-4B-Q4_K_M.gguf' \
+  --output models/Qwen3.5-4B-Q4_K_M.gguf
+"$(dirname "$0")/verify-models"
