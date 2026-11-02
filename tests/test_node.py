@@ -47,11 +47,24 @@ class NodeTests(unittest.TestCase):
             self.assertEqual(loaded["node_id"], "fixture")
             self.assertEqual(path, model)
 
-    def test_load_accepts_explicit_local_models_root(self):
-        root = Path(__file__).parents[1]
-        loaded, model = node.load(root / "configs/qwen3-small.toml", models_root=root.parent / "Tudo Junto/models")
-        self.assertEqual(loaded["node_id"], "llm-small-a")
-        self.assertTrue(model.is_file())
+    def test_load_accepts_explicit_models_root_with_temporary_fixture(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            model_root = root / "models"
+            model_root.mkdir()
+            model = model_root / "tiny.gguf"
+            model.write_bytes(b"temporary model fixture")
+            digest = node.sha256(model)
+            config = root / "node.toml"
+            config.write_text(
+                f'''node_id = "fixture-root"\nbind_host = "127.0.0.1"\nbind_port = 8101\nmodel_file = "models/tiny.gguf"\nmodel_sha256 = "{digest}"\nthreads = 1\ncontext_tokens = 256\nslots = 1\n''',
+                encoding="utf-8",
+            )
+
+            loaded, resolved_model = node.load(config, models_root=model_root)
+
+            self.assertEqual(loaded["node_id"], "fixture-root")
+            self.assertEqual(resolved_model, model)
 
 
 if __name__ == "__main__":
