@@ -1,0 +1,13 @@
+# Desenvolvimento controlado: use apenas loopback/confiável, sem TLS interno.
+node_id = "llm-large-a"
+bind_host = "127.0.0.1"
+bind_port = 8102
+public_url = "http://127.0.0.1:8102"
+model_file = "Qwen3.5-4B-Q4_K_M.gguf"
+model_sha256 = "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4"
+threads = 2
+context_tokens = 4096
+slots = 1
+n_gpu_layers = 0
+chat_template_kwargs = { enable_thinking = false }
+# Combine com Backend `configs/cpu_minimal.toml`, nó prontuario-1.

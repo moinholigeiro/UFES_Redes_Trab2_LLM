@@ -1,5 +1,7 @@
 import importlib.util
 import json
+import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,6 +14,39 @@ spec.loader.exec_module(node)
 
 
 class NodeTests(unittest.TestCase):
+    def test_node_certificate_script_creates_san_cert_and_never_overwrites(self):
+        root = Path(__file__).parents[1]
+        script = root / "scripts" / "create-node-cert.sh"
+        with tempfile.TemporaryDirectory() as folder:
+            env = {**os.environ, "NODE_SECRETS_DIR": folder}
+            subprocess.run(
+                ["bash", str(script), "node-test", "127.0.0.1", "DNS:localhost"],
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            cert = Path(folder) / "node-test.crt"
+            key = Path(folder) / "node-test.key"
+            self.assertTrue(cert.is_file())
+            self.assertEqual(key.stat().st_mode & 0o777, 0o600)
+            info = subprocess.run(
+                ["openssl", "x509", "-in", str(cert), "-noout", "-ext", "subjectAltName"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertIn("IP Address:127.0.0.1", info.stdout)
+            self.assertIn("DNS:localhost", info.stdout)
+            blocked = subprocess.run(
+                ["bash", str(script), "node-test", "127.0.0.1"],
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(blocked.returncode, 2)
+            self.assertIn("nada foi sobrescrito", blocked.stderr)
+
     def test_runtime_argv_uses_slot_limit_and_separates_bind(self):
         config = {
             "node_id": "n1",
@@ -32,6 +67,37 @@ class NodeTests(unittest.TestCase):
         self.assertEqual(args[args.index("--ssl-cert-file") + 1], "node.crt")
         self.assertEqual(json.loads(args[args.index("--chat-template-kwargs") + 1]), {"enable_thinking": False})
 
+    def test_load_resolves_tls_paths_from_repository_and_checks_config_types(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            model = root / "tiny.gguf"
+            model.write_bytes(b"tls fixture model")
+            digest = node.sha256(model)
+            secrets_dir = Path(__file__).parents[1] / "secrets"
+            secrets_dir.mkdir(exist_ok=True)
+            cert = secrets_dir / "fixture-node.crt"
+            key = secrets_dir / "fixture-node.key"
+            cert.write_text("cert", encoding="utf-8")
+            key.write_text("key", encoding="utf-8")
+            try:
+                config = root / "node.toml"
+                config.write_text(
+                    f'''node_id = "fixture-tls"\nbind_host = "127.0.0.1"\nbind_port = 8101\npublic_url = "https://localhost:8101"\nmodel_file = "{model}"\nmodel_sha256 = "{digest}"\nthreads = 1\ncontext_tokens = 256\nslots = 1\ntls_certfile = "secrets/fixture-node.crt"\ntls_keyfile = "secrets/fixture-node.key"\n''',
+                    encoding="utf-8",
+                )
+                loaded, _ = node.load(config)
+                self.assertEqual(loaded["tls_certfile"], cert.resolve())
+                self.assertEqual(loaded["tls_keyfile"], key.resolve())
+                config.write_text(
+                    f'''node_id = "fixture-tls"\nbind_host = "127.0.0.1"\nbind_port = true\nmodel_file = "{model}"\nmodel_sha256 = "{digest}"\nthreads = 1\ncontext_tokens = 256\nslots = 1\n''',
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(ValueError, "devem ser inteiros"):
+                    node.load(config)
+            finally:
+                cert.unlink(missing_ok=True)
+                key.unlink(missing_ok=True)
+
     def test_load_checks_manifest_hash_without_external_dependencies(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -50,20 +116,51 @@ class NodeTests(unittest.TestCase):
     def test_load_accepts_explicit_models_root_with_temporary_fixture(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
-            model_root = root / "models"
-            model_root.mkdir()
-            model = model_root / "tiny.gguf"
+            model_root = root / "weights"
+            nested_root = model_root / "nested"
+            nested_root.mkdir(parents=True)
+            model = nested_root / "tiny.gguf"
             model.write_bytes(b"temporary model fixture")
             digest = node.sha256(model)
             config = root / "node.toml"
             config.write_text(
-                f'''node_id = "fixture-root"\nbind_host = "127.0.0.1"\nbind_port = 8101\nmodel_file = "models/tiny.gguf"\nmodel_sha256 = "{digest}"\nthreads = 1\ncontext_tokens = 256\nslots = 1\n''',
+                f'''node_id = "fixture-root"\nbind_host = "127.0.0.1"\nbind_port = 8101\nmodel_file = "nested/tiny.gguf"\nmodel_sha256 = "{digest}"\nthreads = 1\ncontext_tokens = 256\nslots = 1\n''',
                 encoding="utf-8",
             )
 
             loaded, resolved_model = node.load(config, models_root=model_root)
 
             self.assertEqual(loaded["node_id"], "fixture-root")
+            self.assertEqual(resolved_model, model)
+
+    def test_load_rejects_relative_model_path_traversal(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            config = root / "node.toml"
+            config.write_text(
+                '''node_id = "fixture-traversal"\nbind_host = "127.0.0.1"\nbind_port = 8101\nmodel_file = "../outside.gguf"\nmodel_sha256 = "'''
+                + "0" * 64
+                + '''"\nthreads = 1\ncontext_tokens = 256\nslots = 1\n''',
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "não pode sair de models_root"):
+                node.load(config, models_root=root / "weights")
+
+    def test_load_accepts_absolute_model_path(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            model = root / "external.gguf"
+            model.write_bytes(b"absolute model fixture")
+            digest = node.sha256(model)
+            config = root / "node.toml"
+            config.write_text(
+                f'''node_id = "fixture-absolute"\nbind_host = "127.0.0.1"\nbind_port = 8101\nmodel_file = "{model}"\nmodel_sha256 = "{digest}"\nthreads = 1\ncontext_tokens = 256\nslots = 1\n''',
+                encoding="utf-8",
+            )
+
+            _, resolved_model = node.load(config)
+
             self.assertEqual(resolved_model, model)
 
 

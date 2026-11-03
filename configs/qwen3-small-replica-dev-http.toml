@@ -1,0 +1,13 @@
+# Desenvolvimento controlado: use apenas loopback/confiável, sem TLS interno.
+node_id = "llm-small-b"
+bind_host = "127.0.0.1"
+bind_port = 8103
+public_url = "http://127.0.0.1:8103"
+model_file = "Qwen3-1.7B-Q4_K_M.gguf"
+model_sha256 = "b139949c5bd74937ad8ed8c8cf3d9ffb1e99c866c823204dc42c0d91fa181897"
+threads = 2
+context_tokens = 4096
+slots = 1
+n_gpu_layers = 0
+chat_template_kwargs = { enable_thinking = false }
+# Combine com Backend `configs/m2_replicas.toml`, nó redes-2 (HTTP somente loopback).

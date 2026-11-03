@@ -1,8 +1,8 @@
 node_id = "llm-large-a"
 bind_host = "127.0.0.1"
 bind_port = 8102
-public_url = "https://127.0.0.1:8102"
-model_file = "models/Qwen3.5-4B-Q4_K_M.gguf"
+public_url = "https://llm-large-a:8102"
+model_file = "Qwen3.5-4B-Q4_K_M.gguf"
 model_sha256 = "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4"
 threads = 2
 context_tokens = 4096

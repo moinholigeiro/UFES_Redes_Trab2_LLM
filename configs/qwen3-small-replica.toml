@@ -1,8 +1,8 @@
 node_id = "llm-small-b"
 bind_host = "127.0.0.1"
 bind_port = 8103
-public_url = "https://127.0.0.1:8103"
-model_file = "models/Qwen3-1.7B-Q4_K_M.gguf"
+public_url = "https://llm-small-b:8103"
+model_file = "Qwen3-1.7B-Q4_K_M.gguf"
 model_sha256 = "b139949c5bd74937ad8ed8c8cf3d9ffb1e99c866c823204dc42c0d91fa181897"
 threads = 2
 context_tokens = 4096
