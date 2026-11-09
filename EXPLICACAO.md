@@ -1,15 +1,85 @@
 # Explicação do código — Nós LLM
 
-Este repositório prepara e executa processos independentes de `llama-server`. Ele não contém gateway, fila de aplicação ou autenticação de usuário. As explicações abaixo cobrem código, scripts, configurações e testes sem duplicar pesos GGUF ou segredos.
+Este repositório prepara e executa processos `llama-server` independentes, um por nó. Ele não tem gateway, fila de
+aplicação nem autenticação de usuário: isso é do Backend. A **Parte A** mostra em diagramas onde o nó se encaixa; a
+partir da seção 2, o código é explicado arquivo por arquivo.
 
-## 1. Fluxo de execução
+## 1. Diagramas
 
-1. `scripts/node.py` lê TOML do nó, valida endereço/recursos/TLS, localiza GGUF e compara SHA-256 com o manifesto/configuração.
-2. `scripts/start-node` encaminha argumentos para `node.py`.
-3. `node.py` monta argv e substitui o processo pelo `llama-server` residente.
-4. O Backend conversa com esse processo pela API HTTP compatível OpenAI; ele administra autenticação, seleção, filas e retries.
+**Legenda:** verde = processo deste repositório; cinza tracejado = opcional, fora do caminho padrão.
 
-Cada config descreve uma réplica; várias réplicas podem compartilhar os mesmos pesos, mas têm IDs, portas, slots e processos próprios.
+### 1.1 Onde o nó fica no sistema
+
+```mermaid
+flowchart LR
+    subgraph BE["Repo Backend"]
+        GW["gateway<br/>fila, balanceamento, failover"]
+        LAB["lab.py<br/>baixa binário e modelos,<br/>gera a config, inicia o nó"]
+    end
+    subgraph LLM["Repo LLM (este)"]
+        CFG["config TOML do nó<br/>porta, modelo, threads, slots,<br/>api_key_file"]
+        MAN["models/manifest.json<br/>origem, revisão, SHA-256"]
+        NODE["scripts/node.py<br/>valida config e SHA-256"]:::proc
+        LS["llama-server<br/>(binário oficial fixado)"]:::proc
+        CERT["create-node-cert.sh<br/>(HTTPS por nó, opcional)"]:::opt
+    end
+    LAB -->|"gera"| CFG
+    LAB -->|"python node.py --config … --bin …"| NODE
+    CFG --> NODE
+    MAN -.-> NODE
+    NODE -->|"exec / processo filho"| LS
+    GW -->|"POST /v1/chat/completions (stream)<br/>Authorization: Bearer chave"| LS
+    GW -->|"GET /health (aberto)"| LS
+    CERT -.-> LS
+
+    classDef proc fill:#d9f2e3,stroke:#1d7a4d,color:#0b2e1c
+    classDef opt fill:#eeeeee,stroke:#999999,stroke-dasharray:5 5,color:#555555
+```
+
+### 1.2 O que o `node.py` faz antes de iniciar
+
+```mermaid
+flowchart TB
+    A["lê o TOML"] --> B{"campos obrigatórios e tipos certos?<br/>campo desconhecido?"}
+    B -->|"não"| X["erro, código 2"]
+    B -->|"sim"| C{"public_url em HTTP fora do loopback?"}
+    C -->|"sim, sem api_key_file"| X
+    C -->|"não, ou com chave"| D["resolve caminhos (modelo, TLS, chave)<br/>impede sair de models/"]
+    D --> E{"SHA-256 do modelo confere?"}
+    E -->|"não"| X
+    E -->|"sim"| F["monta os argumentos:<br/>-m, --host, --port, -t, -c, -np (slots),<br/>--jinja, --api-key-file, TLS"]
+    F --> G["Linux: execvp (vira o llama-server)<br/>Windows: processo filho"]
+```
+
+### 1.3 Uma geração vista pelo nó
+
+```mermaid
+sequenceDiagram
+    participant G as gateway (Backend)
+    participant N as llama-server
+    G->>N: POST /v1/chat/completions {messages, stream: true, max_tokens, response_format?}
+    N->>N: confere a chave (senão 401) · ocupa um slot
+    loop cada pedaço gerado
+        N-->>G: data: {choices[0].delta.content}
+    end
+    N-->>G: data: {finish_reason: stop | length}
+    N-->>G: data: {usage: {completion_tokens}}
+    N-->>G: data: [DONE]
+```
+
+O gateway valida essa sequência com rigor: um `[DONE]` só, sem dados depois, `finish_reason` válido. Os `slots` do nó
+precisam ser iguais ao `max_inflight` (K) do nó no gateway; senão o gateway acha que há vaga e o nó enfileira por conta
+própria, escondendo a fila do experimento.
+
+### 1.4 Perguntas de entrevista
+
+| Pergunta | Resposta curta |
+|---|---|
+| Por que um processo por nó? | Cada réplica tem porta, modelo e vagas próprios, e pode estar em outra máquina. O gateway trata cada uma como um destino |
+| O que são `slots`? | Quantas gerações o `llama-server` faz ao mesmo tempo. É o K do modelo de fila do experimento |
+| Por que conferir o SHA-256 toda vez? | Garante que todas as máquinas rodam exatamente o mesmo modelo; um download corrompido não sobe |
+| Por que o `/health` fica aberto e o resto exige chave? | O gateway precisa saber se o nó está vivo sem gastar a chave; o `/health` não expõe nada |
+| Por que a chave e não HTTPS no laboratório? | O TLS entre usuário e gateway já protege o usuário. Na LAN, a chave basta para que outro aluno não use o nó, sem montar certificado por máquina |
 
 ## 2. `scripts/node.py` — validar configuração e iniciar runtime
 
@@ -24,8 +94,9 @@ Cada config descreve uma réplica; várias réplicas podem compartilhar os mesmo
   6. HTTPS exige par de cert/key; caminhos TLS relativos são relativos à raiz do repositório LLM e arquivos precisam existir;
   7. resolve `model_file`: caminho absoluto explícito é aceito; relativo fica dentro de `models_root`; sem override, root padrão é `models/` do repo; impede traversal por `..`/symlink que saia da raiz;
   8. exige arquivo legível e digest igual ao SHA declarado; devolve configuração e caminho do modelo.
-- `argv(config, model)`: forma lista de argumentos sem invocar shell. Informa `llama-server`, arquivo, bind/porta, threads `-t`, contexto `-c`, paralelismo de slots `-np`, jinja, camadas GPU; acrescenta kwargs serializados e cert/key se TLS estiver ativado.
-- `main()`: registra `--config`, `--check` e `--models-root`; trata configuração inválida com código 2; em check imprime estado/hash/runtime encontrado sem iniciar; sem `--check` verifica existência do executável e chama `os.execvp`, tornando llama-server o processo corrente.
+- `argv(config, model, binary)`: forma a lista de argumentos sem invocar shell, começando pelo binário escolhido. Com `api_key_file`, acrescenta `--api-key-file`. Informa `llama-server`, arquivo, bind/porta, threads `-t`, contexto `-c`, paralelismo de slots `-np`, jinja, camadas GPU; acrescenta kwargs serializados e cert/key se TLS estiver ativado.
+- `find_binary(explicit)`: escolhe o `llama-server` nesta ordem: `--bin`, a variável `LLAMA_SERVER` (usada pelo `lab.py`) e o `PATH` (devenv).
+- `main()`: registra `--config`, `--check`, `--models-root` e `--bin`; trata configuração inválida com código 2; em check imprime estado/hash/runtime encontrado sem iniciar; sem `--check` verifica existência do executável e chama `os.execvp`, tornando o llama-server o processo corrente. No Windows, roda como processo filho (`subprocess.call`), porque lá o `execvp` cria outro processo e o pai perderia o controle dele.
 - Bloco `__main__`: transforma retorno em exit status.
 
 ## 3. Scripts de shell
@@ -69,7 +140,8 @@ Cada arquivo define um único runtime e os seus limites. Os comentários identif
 - `model_sha256`: fixa integridade; fonte de hash canônica é `models/manifest.json`.
 - `chat_template_kwargs`: parâmetros entregues ao runtime para comportamento do template, não para fila ou autorização.
 - `bind_host`/`bind_port`: interface e socket de escuta do processo.
-- `public_url`: URL que Backend usará; o checker exige scheme/porta válidos e HTTP restrito a loopback.
+- `public_url`: URL que o Backend usará; o checker exige scheme e porta válidos. HTTP fora do loopback só com `api_key_file`.
+- `api_key_file`: arquivo com a chave do nó (o `lab.py` gera em `.lab/node-api-key`); vira `--api-key-file`.
 - `context_tokens`, `threads`, `slots`, `n_gpu_layers`: recursos de runtime. Contexto e slots têm efeito em memória/concorrência e devem ser medidos no host; perfis são valores iniciais, não benchmark.
 
 ## 5. Ambiente `devenv.nix`
@@ -88,6 +160,9 @@ Cada arquivo define um único runtime e os seus limites. Os comentários identif
 - `test_load_accepts_explicit_models_root_with_temporary_fixture`: prova resolução com subdiretório em root explícita.
 - `test_load_rejects_relative_model_path_traversal`: garante que caminho relativo não escape a raiz.
 - `test_load_accepts_absolute_model_path`: documenta suporte consciente a path absoluto selecionado pelo operador.
+- `test_api_key_file_is_passed_to_runtime_and_allows_lan_http`: nó na LAN com chave; confere `--api-key-file`, `-np` e o binário escolhido.
+- `test_lan_http_without_api_key_is_rejected`: HTTP na LAN sem chave é recusado.
+- `test_find_binary_prefers_explicit_path_then_environment`: ordem de busca do binário.
 
 Esses testes verificam configuração, integridade e argv com arquivos pequenos; não carregam GGUF nem demonstram geração, health real ou cancelamento de runtime.
 

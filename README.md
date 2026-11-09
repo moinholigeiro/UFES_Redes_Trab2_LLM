@@ -1,21 +1,66 @@
-# UFES Redes Trab2 — LLM Node
+# UFES Redes Trab2 — Nó LLM
 
-Pacote de implantação reutilizável para N nós: cada processo executa um runtime llama.cpp residente, com configuração própria por host, ID/porta/modelo/slots fixados. Este repositório não contém gateway, balanceador, fila de aplicação, token de usuário ou lógica de domínio.
+Pacote de implantação dos **nós de inferência** do Projeto 1 (Redes de Computadores, UFES): cada processo é um
+`llama-server` (llama.cpp) com um modelo de pesos abertos, uma porta e um número fixo de vagas (*slots*). Este
+repositório não tem gateway, fila, balanceamento nem usuários: isso é do
+[Backend](../UFES_Redes_Trab2_Backend/). Diagramas e código explicados: [EXPLICACAO.md](EXPLICACAO.md).
 
-## CPU e modelos
+## Jeito normal: pelo `lab.py` do Backend
 
-Entre em `devenv shell`. Os manifestos e hashes esperados ficam em `models/manifest.json`; os pesos GGUF não são versionados. `scripts/download-models` baixa revisões fixas para `models/` e valida SHA-256. Confirme model cards/licenças oficiais antes de redistribuir. O fluxo independente padrão é baixar os pesos para esse diretório e executar `python scripts/node.py --config configs/qwen3-small.toml --check`; isso valida configuração, arquivo e hash, mas não inicia inferência.
+Com os três repositórios lado a lado, o `lab.py` do Backend faz tudo deste repositório:
 
-`model_file` relativo é resolvido dentro de `models_root`, mantendo subdiretórios e rejeitando traversal. Por padrão, a raiz é `models/` deste repositório; `models_root` relativo no TOML é relativo ao diretório do arquivo de configuração. Para pesos já armazenados fora do repositório, passe `--models-root /caminho/autorizado` (caminhos relativos desse argumento são relativos ao diretório corrente). Um `model_file` absoluto é aceito explicitamente. O download/verificação e a escolha de uma raiz externa não dependem de uma cópia legada.
+- baixa o `llama-server` oficial (versão fixa) para `bin/`;
+- baixa os modelos para `models/`, conferindo o SHA-256 de cada um;
+- gera a config do nó em `../UFES_Redes_Trab2_Backend/.lab/nos/`;
+- inicia o `scripts/node.py`.
 
-`tls_certfile`/`tls_keyfile` relativos são resolvidos a partir da raiz do repositório LLM, não do diretório corrente. `public_url` deve usar host/porta do endpoint e não aceita caminhos, credenciais ou query.
+```bash
+cd ../UFES_Redes_Trab2_Backend
+python3 lab.py no --modelo pequeno            # nó da rede do laboratório, porta 8101
+python3 lab.py no --modelo grande --slots 2   # prontuário, porta 8102, 2 vagas
+```
 
-Perfis `*-dev-http.toml` destinam-se somente a desenvolvimento em loopback confiável e devem corresponder aos URLs HTTP no `configs/cpu_minimal.toml` do Backend. Os perfis normais usam HTTPS; gere certificado e chave por host, com SAN igual ao DNS/IP usado pelo Backend, por exemplo `devenv shell -- scripts/create-node-cert.sh llm-small-a llm-small-a`. O certificado é self-signed: agregue os certificados públicos dos nós ao trust bundle local do Backend (`backend_ca_file=secrets/llm-nodes-ca.pem`); a chave privada fica somente no host LLM em `secrets/llm-small-a.key`. O script recusa sobrescrever arquivos, permite `NODE_SECRETS_DIR`, `CERT_DAYS` e SANs extras, mas não é uma PKI para provisionamento remoto. Em hosts remotos, gere chave/CSR no destino e assine com CA aprovada.
+Passo a passo do laboratório: [Backend/docs/LABORATORIO.md](../UFES_Redes_Trab2_Backend/docs/LABORATORIO.md).
 
-`./scripts/start-node --config configs/qwen3-small.toml` inicia a réplica após verificação estrita do hash. Configure réplicas com IDs e portas distintos. Cada profile publica HTTPS e referencia certificado/chave em `secrets/`; provisione por host e acrescente a CA ao trust bundle privado do Backend. Nunca copie a chave ao Backend. Perfis de exemplo reservam slots/threads por processo: distribua threads dentro do budget total da máquina; não some RSS para estimar RAM física compartilhada.
+## Os modelos
 
-O bind é separado do endereço público que o Backend usa. Em rede não confiável, exponha atrás de TLS e ACL/autenticação de serviço; nunca exponha llama-server diretamente à Internet. Não encaminhe tokens de usuário ao nó.
+| Apelido | Modelo | Arquivo | Usado em |
+|---|---|---|---|
+| pequeno | Qwen3 1.7B Q4_K_M (~1,1 GB) | `Qwen3-1.7B-Q4_K_M.gguf` | domínio `redes` (e `prontuario` no modo `--leve`) |
+| grande | Qwen3.5 4B Q4_K_M (~2,7 GB) | `Qwen3.5-4B-Q4_K_M.gguf` | domínio `prontuario` |
 
-## GPU
+Origem, revisão fixa e SHA-256 estão em [`models/manifest.json`](models/manifest.json). Os pesos não vão para o git.
+Confirme a licença no model card oficial antes de redistribuir.
 
-`n_gpu_layers` é configuração por processo e permanece 0 no baseline CPU. Perfil GPU é futuro e exige validação de VRAM/contexto sem substituir resultados CPU.
+## Segurança do nó
+
+| Situação | Como o nó fica |
+|---|---|
+| Mesma máquina do gateway | `bind_host = "127.0.0.1"`; ninguém de fora alcança |
+| Rede do laboratório (padrão do `lab.py no`) | `bind_host = "0.0.0.0"` com **`api_key_file`**: o `llama-server` recebe `--api-key-file` e devolve 401 a quem não mandar `Authorization: Bearer <chave>`. O `/health` continua aberto |
+| Rede não confiável | HTTPS por nó (`tls_certfile`/`tls_keyfile`, `scripts/create-node-cert.sh`), opcional e fora do caminho padrão |
+
+O `node.py` recusa HTTP fora do loopback **sem** chave. Nunca exponha um nó na internet. Tokens de usuário nunca chegam
+ao nó: quem autentica o usuário é o gateway.
+
+## Uso direto (sem o lab.py)
+
+```bash
+python scripts/node.py --config configs/qwen3-small-dev-http.toml --check   # valida config e SHA-256, não inicia
+python scripts/node.py --config <config.toml> --bin /caminho/llama-server   # inicia
+```
+
+O binário é procurado nesta ordem: `--bin`, a variável `LLAMA_SERVER`, e o `PATH` (o `devenv shell` coloca o
+llama.cpp do Nix no `PATH`). No Windows, o `node.py` roda o `llama-server` como processo filho.
+
+Campos da config: `node_id`, `bind_host`, `bind_port`, `public_url`, `model_file`, `model_sha256`, `threads`,
+`context_tokens`, `slots`, e opcionalmente `n_gpu_layers`, `chat_template_kwargs`, `api_key_file`, `tls_certfile` e
+`tls_keyfile`. Campos desconhecidos são recusados.
+
+## Testes
+
+```bash
+python -m unittest discover -s tests -v    # 10 testes; não baixam modelo
+```
+
+O CI do GitHub Actions roda esses testes a cada push. Histórico de mudanças: [CHANGELOG.md](CHANGELOG.md).
