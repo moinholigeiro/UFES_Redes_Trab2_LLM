@@ -19,3 +19,6 @@ __pycache__/
 artifacts/
 *.token
 secrets/
+
+# binário do llama.cpp baixado pelo lab.py do Backend
+bin/
