@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# No Git Bash (Windows), "/CN=..." do openssl viraria um caminho; em Linux a variável não tem efeito.
+export MSYS_NO_PATHCONV=1
 
 if [[ $# -lt 2 || $# -gt 3 ]]; then
   echo "uso: $0 <node-id> <dns-ou-ip-do-certificado> [SANs-adicionais-separados-por-virgula]" >&2

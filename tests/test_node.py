@@ -29,7 +29,8 @@ class NodeTests(unittest.TestCase):
             cert = Path(folder) / "node-test.crt"
             key = Path(folder) / "node-test.key"
             self.assertTrue(cert.is_file())
-            self.assertEqual(key.stat().st_mode & 0o777, 0o600)
+            if os.name != "nt":  # o Windows não representa permissões POSIX
+                self.assertEqual(key.stat().st_mode & 0o777, 0o600)
             info = subprocess.run(
                 ["openssl", "x509", "-in", str(cert), "-noout", "-ext", "subjectAltName"],
                 check=True,
@@ -82,14 +83,14 @@ class NodeTests(unittest.TestCase):
             try:
                 config = root / "node.toml"
                 config.write_text(
-                    f'''node_id = "fixture-tls"\nbind_host = "127.0.0.1"\nbind_port = 8101\npublic_url = "https://localhost:8101"\nmodel_file = "{model}"\nmodel_sha256 = "{digest}"\nthreads = 1\ncontext_tokens = 256\nslots = 1\ntls_certfile = "secrets/fixture-node.crt"\ntls_keyfile = "secrets/fixture-node.key"\n''',
+                    f'''node_id = "fixture-tls"\nbind_host = "127.0.0.1"\nbind_port = 8101\npublic_url = "https://localhost:8101"\nmodel_file = "{model.as_posix()}"\nmodel_sha256 = "{digest}"\nthreads = 1\ncontext_tokens = 256\nslots = 1\ntls_certfile = "secrets/fixture-node.crt"\ntls_keyfile = "secrets/fixture-node.key"\n''',
                     encoding="utf-8",
                 )
                 loaded, _ = node.load(config)
                 self.assertEqual(loaded["tls_certfile"], cert.resolve())
                 self.assertEqual(loaded["tls_keyfile"], key.resolve())
                 config.write_text(
-                    f'''node_id = "fixture-tls"\nbind_host = "127.0.0.1"\nbind_port = true\nmodel_file = "{model}"\nmodel_sha256 = "{digest}"\nthreads = 1\ncontext_tokens = 256\nslots = 1\n''',
+                    f'''node_id = "fixture-tls"\nbind_host = "127.0.0.1"\nbind_port = true\nmodel_file = "{model.as_posix()}"\nmodel_sha256 = "{digest}"\nthreads = 1\ncontext_tokens = 256\nslots = 1\n''',
                     encoding="utf-8",
                 )
                 with self.assertRaisesRegex(ValueError, "devem ser inteiros"):
@@ -106,7 +107,7 @@ class NodeTests(unittest.TestCase):
             digest = node.sha256(model)
             config = root / "node.toml"
             config.write_text(
-                f'''node_id = "fixture"\nbind_host = "127.0.0.1"\nbind_port = 8101\nmodel_file = "{model}"\nmodel_sha256 = "{digest}"\nthreads = 1\ncontext_tokens = 256\nslots = 1\n''',
+                f'''node_id = "fixture"\nbind_host = "127.0.0.1"\nbind_port = 8101\nmodel_file = "{model.as_posix()}"\nmodel_sha256 = "{digest}"\nthreads = 1\ncontext_tokens = 256\nslots = 1\n''',
                 encoding="utf-8",
             )
             loaded, path = node.load(config)
@@ -155,13 +156,69 @@ class NodeTests(unittest.TestCase):
             digest = node.sha256(model)
             config = root / "node.toml"
             config.write_text(
-                f'''node_id = "fixture-absolute"\nbind_host = "127.0.0.1"\nbind_port = 8101\nmodel_file = "{model}"\nmodel_sha256 = "{digest}"\nthreads = 1\ncontext_tokens = 256\nslots = 1\n''',
+                f'''node_id = "fixture-absolute"\nbind_host = "127.0.0.1"\nbind_port = 8101\nmodel_file = "{model.as_posix()}"\nmodel_sha256 = "{digest}"\nthreads = 1\ncontext_tokens = 256\nslots = 1\n''',
                 encoding="utf-8",
             )
 
             _, resolved_model = node.load(config)
 
             self.assertEqual(resolved_model, model)
+
+    @staticmethod
+    def _lan_config(root: Path, model: Path, *, api_key: Path | None, slots: int = 1) -> Path:
+        lines = [
+            'node_id = "lab"',
+            'bind_host = "0.0.0.0"',
+            "bind_port = 8101",
+            'public_url = "http://10.0.0.5:8101"',
+            f'model_file = "{model.as_posix()}"',
+            f'model_sha256 = "{node.sha256(model)}"',
+            "threads = 1",
+            "context_tokens = 256",
+            f"slots = {slots}",
+        ]
+        if api_key is not None:
+            lines.append(f'api_key_file = "{api_key.as_posix()}"')
+        config = root / "node.toml"
+        config.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return config
+
+    def test_api_key_file_is_passed_to_runtime_and_allows_lan_http(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            model = root / "tiny.gguf"
+            model.write_bytes(b"fixture")
+            key = root / "api-key"
+            key.write_text("segredo", encoding="utf-8")
+            loaded, path = node.load(self._lan_config(root, model, api_key=key, slots=2))
+            args = node.argv(loaded, path, "/opt/llama/llama-server")
+            self.assertEqual(args[0], "/opt/llama/llama-server")
+            self.assertEqual(Path(args[args.index("--api-key-file") + 1]), key.resolve())
+            self.assertEqual(args[args.index("-np") + 1], "2")
+
+    def test_lan_http_without_api_key_is_rejected(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            model = root / "tiny.gguf"
+            model.write_bytes(b"fixture")
+            with self.assertRaisesRegex(ValueError, "api_key_file"):
+                node.load(self._lan_config(root, model, api_key=None))
+
+    def test_find_binary_prefers_explicit_path_then_environment(self):
+        with tempfile.TemporaryDirectory() as folder:
+            fake = Path(folder) / "llama-server"
+            fake.write_text("", encoding="utf-8")
+            self.assertEqual(node.find_binary(fake), str(fake))
+            self.assertIsNone(node.find_binary(Path(folder) / "nao-existe"))
+            old = os.environ.get("LLAMA_SERVER")
+            os.environ["LLAMA_SERVER"] = str(fake)
+            try:
+                self.assertEqual(node.find_binary(None), str(fake))
+            finally:
+                if old is None:
+                    os.environ.pop("LLAMA_SERVER")
+                else:
+                    os.environ["LLAMA_SERVER"] = old
 
 
 if __name__ == "__main__":

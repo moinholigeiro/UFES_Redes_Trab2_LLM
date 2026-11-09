@@ -9,6 +9,7 @@ import json
 import shutil
 import os
 import re
+import subprocess
 import sys
 import tomllib
 from pathlib import Path
@@ -27,7 +28,8 @@ def load(path: Path, *, models_root: Path | None = None) -> tuple[dict, Path]:
     config = tomllib.loads(path.read_text(encoding="utf-8"))
     required = ("node_id", "bind_host", "bind_port", "model_file", "model_sha256", "threads", "context_tokens", "slots")
     optional = {
-        "models_root", "public_url", "tls_certfile", "tls_keyfile", "n_gpu_layers", "chat_template_kwargs"
+        "models_root", "public_url", "tls_certfile", "tls_keyfile", "n_gpu_layers", "chat_template_kwargs",
+        "api_key_file",
     }
     missing = [key for key in required if key not in config]
     if missing:
@@ -84,19 +86,19 @@ def load(path: Path, *, models_root: Path | None = None) -> tuple[dict, Path]:
                 loopback = ipaddress.ip_address(parsed_url.hostname).is_loopback
             except ValueError:
                 loopback = False
-        if parsed_url.scheme == "http" and not loopback:
-            raise ValueError("HTTP público só é permitido para loopback; use HTTPS remoto")
+        if parsed_url.scheme == "http" and not loopback and not config.get("api_key_file"):
+            raise ValueError("HTTP fora do loopback exige api_key_file (chave do llama-server) ou HTTPS")
     if public_url.startswith("https://") and not config.get("tls_certfile"):
         raise ValueError("nó HTTPS público exige tls_certfile e tls_keyfile no host LLM")
     if bool(config.get("tls_certfile")) != bool(config.get("tls_keyfile")):
         raise ValueError("tls_certfile e tls_keyfile devem ser informados juntos")
     repo_root = Path(__file__).resolve().parents[1]
-    for key in ("tls_certfile", "tls_keyfile"):
+    for key in ("tls_certfile", "tls_keyfile", "api_key_file"):
         if config.get(key):
             tls_path = Path(config[key]).expanduser()
             config[key] = (tls_path if tls_path.is_absolute() else repo_root / tls_path).resolve()
             if not config[key].is_file():
-                raise ValueError(f"arquivo TLS ausente: {config[key]}")
+                raise ValueError(f"arquivo ausente ({key}): {config[key]}")
     model_path = Path(config["model_file"]).expanduser()
     if model_path.is_absolute():
         model = model_path.resolve()
@@ -120,9 +122,9 @@ def load(path: Path, *, models_root: Path | None = None) -> tuple[dict, Path]:
     return config, model
 
 
-def argv(config: dict, model: Path) -> list[str]:
+def argv(config: dict, model: Path, binary: str = "llama-server") -> list[str]:
     command = [
-        "llama-server", "-m", str(model), "--host", config["bind_host"], "--port", str(config["bind_port"]),
+        binary, "-m", str(model), "--host", config["bind_host"], "--port", str(config["bind_port"]),
         "-t", str(config["threads"]), "-c", str(config["context_tokens"]), "-np", str(config["slots"]), "--jinja",
         "--n-gpu-layers", str(config.get("n_gpu_layers", 0)),
     ]
@@ -131,7 +133,20 @@ def argv(config: dict, model: Path) -> list[str]:
         command += ["--chat-template-kwargs", json.dumps(kwargs, separators=(",", ":"))]
     if config.get("tls_certfile"):
         command += ["--ssl-cert-file", config["tls_certfile"], "--ssl-key-file", config["tls_keyfile"]]
+    if config.get("api_key_file"):
+        # Quem chamar sem `Authorization: Bearer <chave>` recebe 401; /health continua aberto.
+        command += ["--api-key-file", str(config["api_key_file"])]
     return command
+
+
+def find_binary(explicit: Path | None) -> str | None:
+    """Ordem: --bin, variável LLAMA_SERVER (o lab.py usa), e por fim o PATH (devenv)."""
+    if explicit is not None:
+        return str(explicit) if explicit.is_file() else None
+    from_env = os.environ.get("LLAMA_SERVER")
+    if from_env:
+        return from_env if Path(from_env).is_file() else None
+    return shutil.which("llama-server")
 
 
 def main() -> int:
@@ -139,20 +154,25 @@ def main() -> int:
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--check", action="store_true", help="validar configuração e hash, sem iniciar runtime")
     parser.add_argument("--models-root", type=Path, help="sobrescreve a raiz dos pesos GGUF")
+    parser.add_argument("--bin", type=Path, help="caminho do llama-server (padrão: $LLAMA_SERVER ou PATH)")
     args = parser.parse_args()
     try:
         config, model = load(args.config, models_root=args.models_root)
     except (OSError, ValueError, KeyError, TypeError) as error:
         print(f"configuração inválida: {error}", file=sys.stderr)
         return 2
-    command = argv(config, model)
+    binary = find_binary(args.bin)
     if args.check:
-        print(f"{config['node_id']}: config/hash OK; runtime: {shutil.which('llama-server') or 'não encontrado'}")
+        print(f"{config['node_id']}: config/hash OK; runtime: {binary or 'não encontrado'}")
         return 0
-    if shutil.which("llama-server") is None:
-        print("llama-server não encontrado; entre no ambiente devenv", file=sys.stderr)
+    if binary is None:
+        print("llama-server não encontrado; use --bin, LLAMA_SERVER, o lab.py ou o devenv", file=sys.stderr)
         return 2
+    command = argv(config, model, binary)
     print(f"iniciando {config['node_id']} em {config['bind_host']}:{config['bind_port']}", flush=True)
+    if os.name == "nt":
+        # No Windows, execvp cria outro processo e o pai sai; quem nos iniciou perderia o controle.
+        return subprocess.call(command)
     os.execvp(command[0], command)
     return 0
 
