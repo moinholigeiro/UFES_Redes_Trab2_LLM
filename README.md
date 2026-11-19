@@ -64,3 +64,7 @@ python -m unittest discover -s tests -v    # 10 testes; não baixam modelo
 ```
 
 O CI do GitHub Actions roda esses testes a cada push. Histórico de mudanças: [CHANGELOG.md](CHANGELOG.md).
+
+## Teste no laboratório e apresentação
+
+O roteiro de teste com vários PCs e o material para a apresentação (decisões técnicas, trade-offs e perguntas prováveis) estão no repositório Backend: `docs/ROTEIRO-E-APRESENTACAO.pdf`.
